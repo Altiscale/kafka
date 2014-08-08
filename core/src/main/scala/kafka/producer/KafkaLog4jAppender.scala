@@ -22,8 +22,11 @@ import org.apache.log4j.spi.LoggingEvent
 import org.apache.log4j.AppenderSkeleton
 import org.apache.log4j.helpers.LogLog
 import kafka.utils.Logging
-import java.util.{Properties, Date}
+import java.util.{Properties, Date, Calendar}
+import java.net.InetAddress
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+
+import java.io.ByteArrayOutputStream;
 
 class KafkaLog4jAppender extends AppenderSkeleton with Logging {
   var topic: String = null
@@ -67,8 +70,18 @@ class KafkaLog4jAppender extends AppenderSkeleton with Logging {
 
   override def append(event: LoggingEvent)  {
     val message = subAppend(event)
-    LogLog.debug("[" + new Date(event.getTimeStamp).toString + "]" + message)
-    val response = producer.send(new ProducerRecord(topic, message.getBytes()))
+    var hostname : String = InetAddress.getLocalHost().getHostName();
+    val timestamp = event.getTimeStamp;
+    var cal : Calendar = Calendar.getInstance();
+    cal.setTimeInMillis(timestamp);
+    val date = cal.get(Calendar.YEAR) + "-" + cal.get(Calendar.MONTH) + "-" + cal.get(Calendar.DAY_OF_MONTH);
+    val time = cal.get(Calendar.HOUR_OF_DAY) + ":" + cal.get(Calendar.MINUTE) + ":" + cal.get(Calendar.SECOND);
+    val name = event.getLoggerName();
+    val level = event.level;
+    /**** JSON Format ****
+    *********************/
+    val logJson = "{\"hostname\": \"" + hostname + "\", \"timestamp\": " + timestamp + ", \"date\": \"" + date + "\",\"time\": \"" + time + "\", \"name\": \"" + name + "\", \"message\": \"" + message + "\", \"level\": \"" + level + "\"}"
+    val response = producer.send(new ProducerRecord(topic, logJson.getBytes()))
     if (syncSend) response.get
   }
 
