@@ -180,18 +180,14 @@ public class JmxReporter implements MetricsReporter {
         @Override
         public Object getAttribute(String name) throws AttributeNotFoundException, MBeanException, ReflectionException {
             if (this.metrics.containsKey(name))
-                return wrapString(this.metrics.get(name).value());
+                return wrapToLong(this.metrics.get(name).value());
             else
                 throw new AttributeNotFoundException("Could not find attribute " + name);
         }
 
-        private Object wrapString(double value) {
+        private Object wrapToLong(double value) {
             if (Double.isInfinite(value) || Double.isNaN(value)) {
-                return new StringBuilder()
-                    .append("\"")
-                    .append(value)
-                    .append("\"")
-                    .toString();
+                return Double.doubleToLongBits(value);
             }
             return value;
         }
