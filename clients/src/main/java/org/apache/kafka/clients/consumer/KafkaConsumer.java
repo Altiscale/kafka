@@ -145,7 +145,7 @@ import java.util.regex.Pattern;
  *     props.put(&quot;session.timeout.ms&quot;, &quot;30000&quot;);
  *     props.put(&quot;key.deserializer&quot;, &quot;org.apache.kafka.common.serialization.StringDeserializer&quot;);
  *     props.put(&quot;value.deserializer&quot;, &quot;org.apache.kafka.common.serialization.StringDeserializer&quot;);
- *     KafkaConsumer&lt;String, String&gt; consumer = new KafkaConsumer&lt;String, String&gt;(props);
+ *     KafkaConsumer&lt;String, String&gt; consumer = new KafkaConsumer&lt;&gt;(props);
  *     consumer.subscribe(Arrays.asList(&quot;foo&quot;, &quot;bar&quot;));
  *     while (true) {
  *         ConsumerRecords&lt;String, String&gt; records = consumer.poll(100);
@@ -200,22 +200,47 @@ import java.util.regex.Pattern;
  *     props.put(&quot;session.timeout.ms&quot;, &quot;30000&quot;);
  *     props.put(&quot;key.deserializer&quot;, &quot;org.apache.kafka.common.serialization.StringDeserializer&quot;);
  *     props.put(&quot;value.deserializer&quot;, &quot;org.apache.kafka.common.serialization.StringDeserializer&quot;);
- *     KafkaConsumer&lt;String, String&gt; consumer = new KafkaConsumer&lt;String, String&gt;(props);
+ *     KafkaConsumer&lt;String, String&gt; consumer = new KafkaConsumer&lt;&gt;(props);
  *     consumer.subscribe(Arrays.asList(&quot;foo&quot;, &quot;bar&quot;));
- *     int commitInterval = 200;
- *     List&lt;ConsumerRecord&lt;String, String&gt;&gt; buffer = new ArrayList&lt;ConsumerRecord&lt;String, String&gt;&gt;();
+ *     final int minBatchSize = 200;
+ *     List&lt;ConsumerRecord&lt;String, String&gt;&gt; buffer = new ArrayList&lt;&gt;();
  *     while (true) {
  *         ConsumerRecords&lt;String, String&gt; records = consumer.poll(100);
  *         for (ConsumerRecord&lt;String, String&gt; record : records) {
  *             buffer.add(record);
- *             if (buffer.size() &gt;= commitInterval) {
- *                 insertIntoDb(buffer);
- *                 consumer.commitSync();
- *                 buffer.clear();
- *             }
+ *         }
+ *         if (buffer.size() &gt;= minBatchSize) {
+ *             insertIntoDb(buffer);
+ *             consumer.commitSync();
+ *             buffer.clear();
  *         }
  *     }
  * </pre>
+ *
+ * The above example uses {@link #commitSync() commitSync} to mark all received messages as committed. In some cases
+ * you may wish to have even finer control over which messages have been committed by specifying an offset explicitly.
+ * In the example below we commit offset after we finish handling the messages in each partition.
+ * <p>
+ * <pre>
+ *     try {
+ *         while(running) {
+ *             ConsumerRecords&lt;String, String&gt; records = consumer.poll(Long.MAX_VALUE);
+ *             for (TopicPartition partition : records.partitions()) {
+ *                 List&lt;ConsumerRecord&lt;String, String&gt;&gt; partitionRecords = records.records(partition);
+ *                 for (ConsumerRecord&lt;String, String&gt; record : partitionRecords) {
+ *                     System.out.println(record.offset() + &quot;: &quot; + record.value());
+ *                 }
+ *                 long lastOffset = partitionRecords.get(partitionRecords.size() - 1).offset();
+ *                 consumer.commitSync(Collections.singletonMap(partition, new OffsetAndMetadata(lastOffset + 1)));
+ *             }
+ *         }
+ *     } finally {
+ *       consumer.close();
+ *     }
+ * </pre>
+ *
+ * <b>Note: The committed offset should always be the offset of the next message that your application will read.</b>
+ * Thus, when calling {@link #commitSync(Map) commitSync(offsets)} you should add one to the offset of the last message processed.
  *
  * <h4>Subscribing To Specific Partitions</h4>
  *
@@ -243,8 +268,7 @@ import java.util.regex.Pattern;
  *     String topic = &quot;foo&quot;;
  *     TopicPartition partition0 = new TopicPartition(topic, 0);
  *     TopicPartition partition1 = new TopicPartition(topic, 1);
- *     consumer.assign(partition0);
- *     consumer.assign(partition1);
+ *     consumer.assign(Arrays.asList(partition0, partition1));
  * </pre>
  *
  * The group that the consumer specifies is still used for committing offsets, but now the set of partitions will only
@@ -291,7 +315,7 @@ import java.util.regex.Pattern;
  * and {@link #subscribe(Pattern, ConsumerRebalanceListener)}.
  * For example, when partitions are taken from a consumer the consumer will want to commit its offset for those partitions by
  * implementing {@link ConsumerRebalanceListener#onPartitionsRevoked(Collection)}. When partitions are assigned to a
- * consumer, the consumer will want to look up the offset for those new partitions an correctly initialize the consumer
+ * consumer, the consumer will want to look up the offset for those new partitions and correctly initialize the consumer
  * to that position by implementing {@link ConsumerRebalanceListener#onPartitionsAssigned(Collection)}.
  * <p>
  * Another common use for {@link ConsumerRebalanceListener} is to flush any caches the application maintains for
@@ -356,7 +380,7 @@ import java.util.regex.Pattern;
  *
  *     public void run() {
  *         try {
- *             consumer.subscribe("topic");
+ *             consumer.subscribe(Arrays.asList("topic"));
  *             while (!closed.get()) {
  *                 ConsumerRecords records = consumer.poll(10000);
  *                 // Handle new records
@@ -828,11 +852,16 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             do {
                 Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollOnce(remaining);
                 if (!records.isEmpty()) {
-                    // if data is available, then return it, but first send off the
-                    // next round of fetches to enable pipelining while the user is
-                    // handling the fetched records.
+                    // before returning the fetched records, we can send off the next round of fetches
+                    // and avoid block waiting for their responses to enable pipelining while the user
+                    // is handling the fetched records.
+                    //
+                    // NOTE that we use quickPoll() in this case which disables wakeups and delayed
+                    // task execution since the consumed positions has already been updated and we
+                    // must return these records to users to process before being interrupted or
+                    // auto-committing offsets
                     fetcher.initFetches(metadata.fetch());
-                    client.poll(0);
+                    client.quickPoll();
                     return new ConsumerRecords<>(records);
                 }
 
@@ -868,11 +897,13 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         // init any new fetches (won't resend pending fetches)
         Cluster cluster = this.metadata.fetch();
         Map<TopicPartition, List<ConsumerRecord<K, V>>> records = fetcher.fetchedRecords();
-        // Avoid block waiting for response if we already have data available, e.g. from another API call to commit.
+
+        // if data is available already, e.g. from a previous network client poll() call to commit,
+        // then just return it immediately
         if (!records.isEmpty()) {
-            client.poll(0);
             return records;
         }
+
         fetcher.initFetches(cluster);
         client.poll(timeout);
         return fetcher.fetchedRecords();
@@ -913,7 +944,8 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * <p>
      * This commits offsets to Kafka. The offsets committed using this API will be used on the first fetch after every
      * rebalance and also on startup. As such, if you need to store offsets in anything other than Kafka, this API
-     * should not be used.
+     * should not be used. The committed offset should be the next message your application will consume,
+     * i.e. lastProcessedMessageOffset + 1.
      * <p>
      * This is a synchronous commits and will block until either the commit succeeds or an unrecoverable error is
      * encountered (in which case it is thrown to the caller).
@@ -975,7 +1007,8 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * <p>
      * This commits offsets to Kafka. The offsets committed using this API will be used on the first fetch after every
      * rebalance and also on startup. As such, if you need to store offsets in anything other than Kafka, this API
-     * should not be used.
+     * should not be used. The committed offset should be the next message your application will consume,
+     * i.e. lastProcessedMessageOffset + 1.
      * <p>
      * This is an asynchronous call and will not block. Any errors encountered are either passed to the callback
      * (if provided) or discarded.
@@ -1002,6 +1035,9 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      */
     @Override
     public void seek(TopicPartition partition, long offset) {
+        if (offset < 0) {
+            throw new IllegalArgumentException("seek offset must not be a negative number");
+        }
         acquire();
         try {
             log.debug("Seeking to offset {} for partition {}", offset, partition);
@@ -1065,10 +1101,10 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         try {
             if (!this.subscriptions.isAssigned(partition))
                 throw new IllegalArgumentException("You can only check the position for partitions assigned to this consumer.");
-            Long offset = this.subscriptions.consumed(partition);
+            Long offset = this.subscriptions.position(partition);
             if (offset == null) {
                 updateFetchPositions(Collections.singleton(partition));
-                offset = this.subscriptions.consumed(partition);
+                offset = this.subscriptions.position(partition);
             }
             return offset;
         } finally {
@@ -1130,6 +1166,9 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws org.apache.kafka.common.errors.WakeupException if {@link #wakeup()} is called before or while this
      *             function is called
      * @throws org.apache.kafka.common.errors.AuthorizationException if not authorized to the specified topic
+     * @throws org.apache.kafka.common.errors.TimeoutException if the topic metadata could not be fetched before
+     *             expiration of the configured request timeout
+     * @throws org.apache.kafka.common.KafkaException for any other unrecoverable errors
      */
     @Override
     public List<PartitionInfo> partitionsFor(String topic) {
@@ -1154,6 +1193,9 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @return The map of topics and its partitions
      * @throws org.apache.kafka.common.errors.WakeupException if {@link #wakeup()} is called before or while this
      *             function is called
+     * @throws org.apache.kafka.common.errors.TimeoutException if the topic metadata could not be fetched before
+     *             expiration of the configured request timeout
+     * @throws org.apache.kafka.common.KafkaException for any other unrecoverable errors
      */
     @Override
     public Map<String, List<PartitionInfo>> listTopics() {
